@@ -11,6 +11,7 @@ import random
 import sys
 import traceback
 import warnings
+import torch.nn as nn
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
@@ -26,6 +27,7 @@ except:
 import torch
 import torch.distributed as dist
 import transformers
+from vla_utils.action_embedding import SpecialTokenUpdater
 from internvl.dist_utils import init_dist
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (InternVisionConfig,
@@ -861,6 +863,10 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
+    # Add special action tokens 
+    action_tokens = SpecialTokenUpdater.ACTION_TOKENS
+    # num_action_tokens = tokenizer.add_tokens(action_tokens, special_tokens=True)
+
     # Load pretrained model, tokenizer, and image processor
     tokenizer_path = model_args.model_name_or_path or model_args.llm_path
     logger.info(f'Loading Tokenizer: {tokenizer_path}')
@@ -870,9 +876,11 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN] + action_tokens
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+
+
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
 
     if data_args.use_packed_ds:
@@ -963,11 +971,38 @@ def main():
     model.config.force_image_size = data_args.force_image_size
     model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
 
+    action_token_init_mode = "im_start"  # choose from ["average", "im_start", "zero", "random"]
+
     if num_new_tokens > 0:
         model.language_model.resize_token_embeddings(len(tokenizer))
         output_embeddings = model.language_model.get_output_embeddings().weight.data
         output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+        # Get all new token ids
+        new_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in token_list if tokenizer.convert_tokens_to_ids(t) >= output_embeddings.shape[0] - num_new_tokens]
+        # Get action token ids
+        action_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in action_tokens if tokenizer.convert_tokens_to_ids(t) in new_token_ids]
+
+        # Assign average to all new tokens first
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+        # Custom initialization for action tokens
+        if action_token_init_mode == "average":
+            for idx in action_token_ids:
+                output_embeddings[idx] = output_embeddings_avg.squeeze(0)
+        elif action_token_init_mode == "im_start":
+            im_start_token_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            im_start_embedding = output_embeddings[im_start_token_id].clone()
+            for idx in action_token_ids:
+                output_embeddings[idx] = im_start_embedding
+        elif action_token_init_mode == "ones":
+            for idx in action_token_ids:
+                output_embeddings[idx] = 1
+        elif action_token_init_mode == "he":
+            for idx in action_token_ids:
+                nn.init.normal_(output_embeddings[idx], mean=0.0, std=1.0)
+        else:
+            raise ValueError(f"Unknown action_token_init_mode: {action_token_init_mode}")
 
         model.config.llm_config.vocab_size = len(tokenizer)
         model.language_model.config.vocab_size = len(tokenizer)
